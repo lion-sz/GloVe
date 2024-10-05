@@ -1,3 +1,10 @@
+struct CoocRec
+    i::Int32
+    j::Int32
+    x::Float32
+end
+
+
 abstract type AbstractGlove end
 
 struct GloveModel{F<:AbstractFloat} <: AbstractGlove
@@ -7,30 +14,15 @@ struct GloveModel{F<:AbstractFloat} <: AbstractGlove
     b̃::Vector{F}
 end
 
-function GloveModel(
-    d::Int,
-    k::Int,
-    F::Type,
-    range::Float64,
-    lower::Union{Float64,Nothing} = nothing,
-    b_range::Union{Float64,Nothing} = nothing,
-)
-    if isnothing(lower)
-        lower = -F(range / 2)
-    else
-        lower = F(lower)
+function GloveModel(d::Int, k::Int, F::Type, range::Union{Float64,Nothing})
+    if isnothing(range)
+        range = F(1 / k)
     end
-    if isnothing(b_range)
-        b_range = range
-    end
-    # I sample b such that the expected inner product corresponds
-    # to a desired X (here set to 1).
-    b_lower = (log(1) - k * (lower + range / 2)^2) / 2 - b_range / 2
     return GloveModel(
-        rand(F, k, d) .* F(range) .+ lower,
-        rand(F, k, d) .* F(range) .+ lower,
-        rand(F, d) .* F(b_range) .+ F(b_lower),
-        rand(F, d) .* F(b_range) .+ F(b_lower),
+        rand(F, k, d) .* F(range) .- F(range / 2),
+        rand(F, k, d) .* F(range) .- F(range / 2),
+        rand(F, d) .* F(range) .- F(range / 2),
+        rand(F, d) .* F(range) .- F(range / 2),
     )
 end
 
@@ -46,41 +38,38 @@ function train_epoch!(glove::GloveModel, opt::AdaGrad, file::CoocFile)
     ind = 1
     chunk, state = iterate(file)
     next_chunk = -1
-    # Load the first batch
-    res = Vector{Vector{Int32}}(undef, 3)
-    res_next = Vector{Vector{Int32}}(undef, 3)
+    # The first position is the current chunk, 
+    # The upcoming chunk is stored in the second position.
+    chunks = Vector{Vector{CoocRec}}(undef, 2)
     load_time = @elapsed begin
-        res .= [load_chunk(file, i, chunk) for i in ["I", "J", "X"]]
+        chunks[1] = load_chunk(file, chunk)
     end
     while true
         iter_res = iterate(file, state)
-        res_next = Vector{Vector{Int32}}(undef, 3)
-        if !isnothing(iter_res)
+        if isnothing(iter_res)
+            next_chunk = nothing
+        else
             next_chunk, state = iter_res
             # Load the next chunk
-            load_time += @elapsed t = @async begin
-                if !isnothing(next_chunk)
-                    @async res_next[1] = load_chunk(file, "I", next_chunk)
-                    @async res_next[2] = load_chunk(file, "J", next_chunk)
-                    @async res_next[3] = load_chunk(file, "X", next_chunk)
-                end
+            t = @async begin
+                chunks[2] = load_chunk(file, next_chunk)
             end
         end
         # Perform the actual training.
         loss = 0.0
-        I, J, X = res
-        @batch reduction = ((+, loss)) for i in eachindex(res[1])
-            loss += step!(glove, opt, I[i], J[i], X[i])
-            loss += step!(glove, opt, J[i], I[i], X[i])
+        records = chunks[1]
+        @batch reduction = ((+, loss)) for i in eachindex(records)
+            @inbounds loss += step!(glove, opt, records[i], false)
+            @inbounds loss += step!(glove, opt, records[i], true)
         end
-        losses[ind] = loss / length(res[1])
+        losses[ind] = loss / length(records)
         # Set up next iteration.
         if isnothing(iter_res)
             break
         else
             load_time += @elapsed wait(t)
             ind += 1
-            res .= res_next
+            chunks[1] = chunks[2]
         end
     end
     println("Total time spend loading data $load_time")
@@ -91,19 +80,20 @@ end
 function step!(
     glove::GloveModel{F},
     opt::AdaGrad{F},
-    i::Int32,
-    j::Int32,
-    x::Int32,
+    crec::CoocRec,
+    inverse::Bool,
 )::F where {F<:AbstractFloat}
+    i = inverse ? crec.j : crec.i
+    j = inverse ? crec.i : crec.j
     # loss computation
     w = @view glove.w[:, i]
     w̃ = @view glove.w̃[:, j]
     #d = (dot(w, w̃) + glove.b[i] + glove.b̃[j] - log(F(x)))
-    d = glove.b[i] + glove.b̃[j] - log(F(x))
+    d = glove.b[i] + glove.b̃[j] - log(F(crec.x))
     @turbo for k in eachindex(w)
         d += w[k] * w̃[k]
     end
-    f = min(F((x / 100)^0.75), F(1.0))
+    f = min(F((crec.x / 100)^0.75), F(1.0))
     # Update the running sums.
     tmp = (F(2) * f * d)
     @turbo for k in eachindex(w)

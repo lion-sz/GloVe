@@ -1,3 +1,5 @@
+Adapt.@adapt_structure CoocRec
+
 struct CudaGlove{F<:AbstractFloat,mat<:AbstractMatrix{F},vec<:AbstractVector{F}} <:
        AbstractGlove
     d::Int32
@@ -26,137 +28,67 @@ function cpu(m::CudaGlove{F}) where {F<:AbstractFloat}
 end
 
 
-function cuda_train_block_single_warp!(
-    glove::CudaGlove{F},
-    opt::AdaGradCuda{F},
-    I::CuDeviceVector{Int32},
-    J::CuDeviceVector{Int32},
-    X::CuDeviceVector{Int32},
-    losses::CuDeviceVector{F},
-) where {F<:AbstractFloat}
-    thread_id = threadIdx().x
-    stride = blockDim().x
-    block_id = blockIdx().x
-    block_stride = gridDim().x
-
-    ind = block_id
-    @inbounds while ind <= length(I)
-        i = I[ind]
-        j = J[ind]
-        x = X[ind]
-        # Compute the inner product
-        inner = F(0.0)
-        k = thread_id
-        while k <= glove.k
-            inner += glove.w[k, i] * glove.w[k, j]
-            k += stride
-        end
-        inner += shfl_xor_sync(UInt32(0xFF), inner, 16)
-        inner += shfl_xor_sync(UInt32(0xFF), inner, 8)
-        inner += shfl_xor_sync(UInt32(0xFF), inner, 4)
-        inner += shfl_xor_sync(UInt32(0xFF), inner, 2)
-        inner += shfl_xor_sync(UInt32(0xFF), inner, 1)
-        # Compute the distance
-        d = inner + glove.b[i] + glove.b̃[j] - log(F(x))
-        f = min(F(x / 100i32)^F(0.75), F(1.0))
-        temp = F(2.0) * f * d
-        # Update w and w̃
-        k = thread_id
-        while k <= glove.k
-            opt.Gw[k, i] += (temp * glove.w̃[k, j])^2
-            opt.Gw̃[k, j] += (temp * glove.w[k, i])^2
-            glove.w[k, i] += temp * glove.w̃[k, j] / (sqrt(opt.Gw[k, i]) + F(1e-6)) * opt.η
-            glove.w̃[k, j] += temp * glove.w[k, i] / (sqrt(opt.Gw̃[k, j]) + F(1e-6)) * opt.η
-            k += stride
-        end
-        # Update b and b̃. Only done by one thread in each block
-        if thread_id == 1
-            opt.Gb[i] += temp^2
-            opt.Gb̃[j] += temp^2
-            glove.b[i] -= temp / (sqrt(opt.Gb[i]) + F(1e-6))
-            glove.b̃[j] -= temp / (sqrt(opt.Gb̃[j]) + F(1e-6))
-            losses[block_id] += f * d^2
-        end
-        ind += block_stride
+function cu_dot(warp, glove::CudaGlove{F}, i::Int32, j::Int32)::F where {F<:AbstractFloat}
+    k = CG.thread_rank(warp)
+    acc = 0.0f0
+    while k <= size(glove.w, 1)
+        acc += glove.w[k, i] * glove.w̃[k, j]
+        k += Int32(32)
     end
+    # Shuffle results between the group.
+    acc += CG.shfl_down(warp, acc, 16)
+    acc += CG.shfl_down(warp, acc, 8)
+    acc += CG.shfl_down(warp, acc, 4)
+    acc += CG.shfl_down(warp, acc, 2)
+    acc += CG.shfl_down(warp, acc, 1)
+    acc = CG.shfl(warp, acc, 1)
+    return acc
 end
 
-
-function cuda_train_block!(
+function cu_train_block!(
     glove::CudaGlove{F},
     opt::AdaGradCuda{F},
-    I::CuDeviceVector{Int32},
-    J::CuDeviceVector{Int32},
-    X::CuDeviceVector{Int32},
-    losses::CuDeviceVector{F},
+    crecs::AbstractVector{CoocRec},
+    losses::CuDeviceMatrix{F},
 ) where {F<:AbstractFloat}
-    tb = CG.this_thread_block()
-    warp = CG.coalesced_threads()
-
-    thread_id = threadIdx().x
-    stride = blockDim().x
+    # These control the outer loop.
     block_id = blockIdx().x
-    block_stride = gridDim().x
-    shared = CuStaticSharedArray(F, 32)
-    if thread_id <= 32
-        shared[thread_id] = F(0.0)
-    end
+    n_warps = Int32(blockDim().x / 32)
+    block_stride = gridDim().x * Int32(n_warps / 2)
 
-    ind = block_id
-    @inbounds while ind <= length(I)
-        i = I[ind]
-        j = J[ind]
-        x = X[ind]
-        # Compute the inner product
-        inner = F(0.0)
-        k = thread_id
-        while k <= glove.k
-            inner += glove.w[k, i] * glove.w[k, j]
-            k += stride
-        end
-        inner += CG.shfl_down(warp, inner, 16)
-        inner += CG.shfl_down(warp, inner, 8)
-        inner += CG.shfl_down(warp, inner, 4)
-        inner += CG.shfl_down(warp, inner, 2)
-        inner += CG.shfl_down(warp, inner, 1)
-        # Write to shared memory.
-        if CG.thread_rank(warp) == 1
-            shared[Int32((thread_id - 1) / 32i32)+1]
-        end
-        CG.sync(tb)
-        # The first warp collects the results.
-        if thread_id <= 32
-            inner = shared[thread_id]
-            inner += CG.shfl_down(warp, inner, 16)
-            inner += CG.shfl_down(warp, inner, 8)
-            inner += CG.shfl_down(warp, inner, 4)
-            inner += CG.shfl_down(warp, inner, 2)
-            inner += CG.shfl_down(warp, inner, 1)
-        end
-        if thread_id == 1
-            shared[1] = inner
-        end
-        CG.sync(tb)
+    warp = CG.coalesced_threads()
+    warp_id = floor(Int32, (threadIdx().x - 1) / 32)
+    thread_id = CG.thread_rank(warp)
+
+    ind = block_id + warp_id
+    @inbounds while ind <= length(crecs)
+        # Odd numbered warps do the inverse step.
+        crec = crecs[ind]
+        i = (warp_id % Int32(2)) == 0 ? crec.i : crec.j
+        j = (warp_id % Int32(2)) == 0 ? crec.j : crec.i
+        x = crec.x
         # Compute the distance
-        d = shared[1] + glove.b[i] + glove.b̃[j] - log(F(x))
+        d = cu_dot(warp, glove, i, j) + glove.b[i] + glove.b̃[j] - log(F(x))
         f = min(F(x / 100i32)^F(0.75), F(1.0))
-        temp = F(2.0) * f * d
+        deriv = F(2.0) * f * d
         # Update w and w̃
         k = thread_id
         while k <= glove.k
-            opt.Gw[k, i] += (temp * glove.w̃[k, j])^2
-            opt.Gw̃[k, j] += (temp * glove.w[k, i])^2
-            glove.w[k, i] += temp * glove.w̃[k, j] / (sqrt(opt.Gw[k, i]) + F(1e-6)) * opt.η
-            glove.w̃[k, j] += temp * glove.w[k, i] / (sqrt(opt.Gw̃[k, j]) + F(1e-6)) * opt.η
-            k += stride
+            opt.Gw[k, i] += (deriv * glove.w̃[k, j])^2
+            opt.Gw̃[k, j] += (deriv * glove.w[k, i])^2
+            temp_w = glove.w[k, i] - opt.η * deriv * glove.w̃[k, j] / sqrt(opt.Gw[k, i])
+            temp_w̃ = glove.w̃[k, j] - opt.η * deriv * glove.w[k, i] / sqrt(opt.Gw̃[k, j])
+            glove.w[k, i] = temp_w
+            glove.w̃[k, j] = temp_w̃
+            k += Int32(32)
         end
         # Update b and b̃. Only done by one thread in each block
         if thread_id == 1
-            opt.Gb[i] += temp^2
-            opt.Gb̃[j] += temp^2
-            glove.b[i] -= temp / (sqrt(opt.Gb[i]) + F(1e-6))
-            glove.b̃[j] -= temp / (sqrt(opt.Gb̃[j]) + F(1e-6))
-            losses[block_id] += f * d^2
+            opt.Gb[i] += deriv^2
+            opt.Gb̃[j] += deriv^2
+            glove.b[i] -= opt.η * deriv / (sqrt(opt.Gb[i]) + F(1e-6))
+            glove.b̃[j] -= opt.η * deriv / (sqrt(opt.Gb̃[j]) + F(1e-6))
+            losses[block_id, warp_id+1] += f * d^2
         end
         ind += block_stride
     end
@@ -173,81 +105,50 @@ function train_epoch!(
     opt::AdaGradCuda{F},
     file::CoocFile;
     n_blocks::Int = 512,
-    n_threads::Int = 64,
 ) where {F<:AbstractFloat}
     losses = zeros(file.n_chunks)
-    cu_losses = CUDA.zeros(F, n_blocks)
+    cu_losses = CUDA.zeros(F, (n_blocks, 4))
     ind = 1
     chunk, state = iterate(file)
     next_chunk = -1
     # Load the first batch
-    res = Vector{CuVector{Int32}}(undef, 3)
-    res_next = Vector{CuVector{Int32}}(undef, 3)
+    chunks = Vector{CuVector{CoocRec}}(undef, 2)
     load_time = @elapsed begin
-        res .= [cu(load_chunk(file, i, chunk)) for i in ["I", "J", "X"]]
+        chunks[1] = cu(load_chunk(file, chunk))
     end
+    train_time = 0.0
     while true
         iter_res = iterate(file, state)
-        res_next = Vector{CuVector{Int32}}(undef, 3)
-        if !isnothing(iter_res)
+        if isnothing(iter_res)
+            next_chunk = nothing
+        else
             next_chunk, state = iter_res
             # Load the next chunk
             load_time += @elapsed t = @async begin
-                if !isnothing(next_chunk)
-                    @async res_next[1] = cu(load_chunk(file, "I", next_chunk))
-                    @async res_next[2] = cu(load_chunk(file, "J", next_chunk))
-                    @async res_next[3] = cu(load_chunk(file, "X", next_chunk))
-                end
+                chunks[2] = cu(load_chunk(file, next_chunk))
             end
         end
         # Perform the actual training.
-        I, J, X = res
+        records = chunks[1]
         fill!(cu_losses, F(0.0))
-        if n_threads == 32
-            @cuda threads = 32 blocks = n_blocks cuda_train_block_single_warp!(
+        train_time += @elapsed CUDA.@sync begin
+            @cuda threads = 128 blocks = n_blocks cu_train_block!(
                 glove,
                 opt,
-                I,
-                J,
-                X,
-                cu_losses,
-            )
-            @cuda threads = 32 blocks = n_blocks cuda_train_block_single_warp!(
-                glove,
-                opt,
-                J,
-                I,
-                X,
-                cu_losses,
-            )
-        else
-            @cuda threads = n_threads blocks = n_blocks cuda_train_block!(
-                glove,
-                opt,
-                I,
-                J,
-                X,
-                cu_losses,
-            )
-            @cuda threads = n_threads blocks = n_blocks cuda_train_block!(
-                glove,
-                opt,
-                J,
-                I,
-                X,
+                records,
                 cu_losses,
             )
         end
-        losses[ind] = sum(cu_losses) / length(I)
+        losses[ind] = sum(cu_losses) / length(records)
         # Set up next iteration.
         if isnothing(iter_res)
             break
         else
             load_time += @elapsed wait(t)
             ind += 1
-            res .= res_next
+            chunks[1] = chunks[2]
         end
     end
-    # println("Total time spend loading data $load_time")
+    println("Time spend training $train_time, time loading $load_time")
     return losses
 end
