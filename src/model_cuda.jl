@@ -27,12 +27,11 @@ function cpu(m::CudaGlove{F}) where {F<:AbstractFloat}
     return GloveModel{F}(Array(m.w), Array(m.w̃), Array(m.b), Array(m.b̃))
 end
 
-
-function cu_dot(warp, glove::CudaGlove{F}, i::Int32, j::Int32)::F where {F<:AbstractFloat}
+function cu_dot(warp, a::AbstractVector, b::AbstractVector)::Float32
     k = CG.thread_rank(warp)
     acc = 0.0f0
-    while k <= size(glove.w, 1)
-        acc += glove.w[k, i] * glove.w̃[k, j]
+    while k <= length(a)
+        acc += a[k] * b[k]
         k += Int32(32)
     end
     # Shuffle results between the group.
@@ -44,6 +43,7 @@ function cu_dot(warp, glove::CudaGlove{F}, i::Int32, j::Int32)::F where {F<:Abst
     acc = CG.shfl(warp, acc, 1)
     return acc
 end
+
 
 function cu_train_block!(
     glove::CudaGlove{F},
@@ -60,34 +60,45 @@ function cu_train_block!(
     warp_id = floor(Int32, (threadIdx().x - 1) / 32)
     thread_id = CG.thread_rank(warp)
 
-    ind = block_id + warp_id
+    shared = CuDynamicSharedArray(F, (glove.k, 2, n_warps))
+    w = @view shared[:, 1i32, warp_id+1i32]
+    w̃ = @view shared[:, 2i32, warp_id+1i32]
+
+    ind = (block_id - 1i32) * Int32(n_warps / 2) + 1i32 + floor(Int32, warp_id / 2)
     @inbounds while ind <= length(crecs)
         # Odd numbered warps do the inverse step.
         crec = crecs[ind]
-        i = (warp_id % Int32(2)) == 0 ? crec.i : crec.j
-        j = (warp_id % Int32(2)) == 0 ? crec.j : crec.i
+        i = (warp_id % 2i32) == 0i32 ? crec.i : crec.j
+        j = (warp_id % 2i32) == 0i32 ? crec.j : crec.i
         x = crec.x
+        # Copy to the local memory.
+        k = thread_id
+        while k <= glove.k
+            w[k] = glove.w[k, i]
+            w̃[k] = glove.w̃[k, j]
+            k += 32i32
+        end
         # Compute the distance
-        d = cu_dot(warp, glove, i, j) + glove.b[i] + glove.b̃[j] - log(F(x))
+        d = cu_dot(warp, w, w̃) + glove.b[i] + glove.b̃[j] - log(F(x))
         f = min(F(x / 100i32)^F(0.75), F(1.0))
-        deriv = F(2.0) * f * d
+        tmp = f * d
         # Update w and w̃
         k = thread_id
         while k <= glove.k
-            opt.Gw[k, i] += (deriv * glove.w̃[k, j])^2
-            opt.Gw̃[k, j] += (deriv * glove.w[k, i])^2
-            temp_w = glove.w[k, i] - opt.η * deriv * glove.w̃[k, j] / sqrt(opt.Gw[k, i])
-            temp_w̃ = glove.w̃[k, j] - opt.η * deriv * glove.w[k, i] / sqrt(opt.Gw̃[k, j])
-            glove.w[k, i] = temp_w
-            glove.w̃[k, j] = temp_w̃
+            dw = tmp * w̃[k]
+            dw̃ = tmp * w[k]
+            opt.Gw[k, i] += dw^2
+            opt.Gw̃[k, j] += dw̃^2
+            glove.w[k, i] -= opt.η * dw / sqrt(opt.Gw[k, i])
+            glove.w̃[k, j] -= opt.η * dw̃ / sqrt(opt.Gw̃[k, j])
             k += Int32(32)
         end
         # Update b and b̃. Only done by one thread in each block
         if thread_id == 1
-            opt.Gb[i] += deriv^2
-            opt.Gb̃[j] += deriv^2
-            glove.b[i] -= opt.η * deriv / (sqrt(opt.Gb[i]) + F(1e-6))
-            glove.b̃[j] -= opt.η * deriv / (sqrt(opt.Gb̃[j]) + F(1e-6))
+            opt.Gb[i] += tmp^2
+            opt.Gb̃[j] += tmp^2
+            glove.b[i] -= opt.η * tmp / sqrt(opt.Gb[i])
+            glove.b̃[j] -= opt.η * tmp / sqrt(opt.Gb̃[j])
             losses[block_id, warp_id+1] += f * d^2
         end
         ind += block_stride
@@ -132,7 +143,7 @@ function train_epoch!(
         records = chunks[1]
         fill!(cu_losses, F(0.0))
         train_time += @elapsed CUDA.@sync begin
-            @cuda threads = 128 blocks = n_blocks cu_train_block!(
+            @cuda shmem = glove.k * 2 * 4 * 4 threads = 128 blocks = n_blocks cu_train_block!(
                 glove,
                 opt,
                 records,

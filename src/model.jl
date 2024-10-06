@@ -88,25 +88,24 @@ function step!(
     # loss computation
     w = @view glove.w[:, i]
     w̃ = @view glove.w̃[:, j]
-    #d = (dot(w, w̃) + glove.b[i] + glove.b̃[j] - log(F(x)))
     d = glove.b[i] + glove.b̃[j] - log(F(crec.x))
     @turbo for k in eachindex(w)
         d += w[k] * w̃[k]
     end
     f = min(F((crec.x / 100)^0.75), F(1.0))
     # Update the running sums.
-    tmp = (F(2) * f * d)
+    tmp = f * d
     @turbo for k in eachindex(w)
-        tw = w[k]
-        tw̃ = w̃[k]
-        opt.Gw[k, i] += (tmp * tw̃)^2
-        opt.Gw̃[k, j] += (tmp * tw)^2
-        w[k] = tw - tmp * tw̃ * opt.η / sqrt(opt.Gw[k, i])
-        w̃[k] = tw̃ - tmp * tw * opt.η / sqrt(opt.Gw̃[k, j])
+        dw = tmp * w̃[k]
+        dw̃ = tmp * w[k]
+        opt.Gw[k, i] += dw^2
+        opt.Gw̃[k, j] += dw̃^2
+        w[k] -= dw * opt.η / sqrt(opt.Gw[k, i])
+        w̃[k] -= dw̃ * opt.η / sqrt(opt.Gw̃[k, j])
     end
     opt.Gb[i] += tmp^2
     opt.Gb̃[j] += tmp^2
-    glove.b[i] -= tmp * opt.η / sqrt(opt.Gb[i])
-    glove.b̃[j] -= tmp * opt.η / sqrt(opt.Gb̃[j])
+    glove.b[i] -= opt.η * tmp / sqrt(opt.Gb[i])
+    glove.b̃[j] -= opt.η * tmp / sqrt(opt.Gb̃[j])
     return f * d^2
 end
